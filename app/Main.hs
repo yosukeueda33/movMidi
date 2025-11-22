@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DeriveGeneric     #-}
 
 module Main where
 
@@ -21,6 +22,20 @@ import           System.Posix.IO
 import           System.Posix.Types
 import           Control.Concurrent (threadDelay, forkIO)
 import Control.Exception (catch, IOException)
+import qualified Dhall as DHL
+
+import ArgParse (readPathArg, checkFilePath)
+
+data Config = Config { cfgChannel :: DHL.Natural
+                     , cfgNote :: DHL.Natural
+                     , cfgFrom :: Double
+                     , cfgTo :: Double
+                     , cfgSocket :: DHL.Text
+                     }
+    deriving (DHL.Generic, Show)
+
+instance DHL.FromDhall Config
+
 
 enumerateDevices :: IO [DeviceInfo]
 enumerateDevices = do
@@ -69,6 +84,13 @@ sendMPV h msg =
 
 main :: IO ()
 main = do
+  -- Read config path from command line.
+  cfgPath <- readPathArg
+  checkFilePath "config" cfgPath
+  -- Load config.
+  config <- DHL.inputFile DHL.auto cfgPath :: IO [Config]
+  print config
+
   -- Connect to mpv socket
   putStrLn "Waiting for mpv socket..."
   waitForSocket "/tmp/mpvsocket"

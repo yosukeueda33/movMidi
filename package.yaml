@@ -27,6 +27,8 @@ dependencies:
 - network
 - bytestring
 - directory
+- dhall
+- filepath
 
 ghc-options:
 - -Wall
