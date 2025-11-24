@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE DeriveGeneric     #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE TupleSections #-}
 
 module Main where
 
@@ -8,19 +9,20 @@ import Sound.PortMidi (PMEvent(..), DeviceInfo(..),
                        initialize, countDevices, getDeviceInfo,
                        openInput, readEvents, setFilter,
                        filterSysex, decodeMsg, status, data1, data2,
-                       input)
-import Control.Monad (forever)
+                       input, PMStream)
+import Control.Monad (forever, foldM)
 import Data.Bits ((.&.))
+import Data.List (nub)
+import qualified Data.Text as T
+import qualified Data.Map.Strict as M
 import qualified Data.ByteString.Char8  as BS
-import           System.IO
-import           System.Process
-import           Network.Socket
-                  (Socket, SockAddr(SockAddrUnix), socket, connect
-                  , Family(AF_UNIX), SocketType(Stream), socketToHandle)
-import           System.Directory
-import           System.Posix.IO
-import           System.Posix.Types
-import           Control.Concurrent (threadDelay, forkIO)
+import System.IO
+import Network.Socket
+        (Socket, SockAddr(SockAddrUnix), socket, connect
+        , Family(AF_UNIX), SocketType(Stream), socketToHandle)
+import System.Directory (doesFileExist)
+import System.Posix.Types (Fd(..))
+import Control.Concurrent (threadDelay, forkIO, ThreadId, killThread)
 import Control.Exception (catch, IOException)
 import qualified Dhall as DHL
 
@@ -36,6 +38,9 @@ data Config = Config { cfgChannel :: DHL.Natural
 
 instance DHL.FromDhall Config
 
+type NoteMap = M.Map (Int, Int) [(FilePath, Double, Double)]
+type ThreadMap = M.Map FilePath (Maybe ThreadId)
+type SockMap = M.Map FilePath Handle
 
 enumerateDevices :: IO [DeviceInfo]
 enumerateDevices = do
@@ -88,15 +93,26 @@ main = do
   cfgPath <- readPathArg
   checkFilePath "config" cfgPath
   -- Load config.
-  config <- DHL.inputFile DHL.auto cfgPath :: IO [Config]
-  print config
+  configs <- DHL.inputFile DHL.auto cfgPath :: IO [Config]
+  print configs
+
+  let sockPaths = nub $ map (T.unpack . cfgSocket) configs :: [FilePath]
 
   -- Connect to mpv socket
   putStrLn "Waiting for mpv socket..."
-  waitForSocket "/tmp/mpvsocket"
+  mapM_ waitForSocket sockPaths 
+
   putStrLn "Connecting to mpv..."
-  sockH <- connectToMPV "/tmp/mpvsocket" :: IO Handle
+  sockMap <- foldM (\m path -> flip (M.insert path) m <$> connectToMPV path)
+                   M.empty sockPaths :: IO SockMap
   putStrLn "Connected to mpv."
+
+  -- Convert configs to NoteMap.
+  let noteMap = foldl (\m c -> M.insertWith (++)
+                                 (fromEnum $ cfgChannel c, fromEnum $ cfgNote c)
+                                 [(T.unpack $ cfgSocket c, cfgFrom c , cfgTo c)]
+                                 m)
+                  M.empty configs :: NoteMap
 
   -- Initialize PortMIDI
   initialize
@@ -109,42 +125,99 @@ main = do
   -- devID <- readLn
   let devID = 3
 
-  result <- openInput devID
-  case result of
+  r <- openInput devID
+  case r of
     Left err -> putStrLn ("Error opening MIDI: " ++ show err)
-    Right stream -> do
+    Right pmStream -> do
       putStrLn "Listening for MIDI..."
+      setFilter pmStream filterSysex
+      let
+        hEventFunc = handleEvent noteMap sockMap 
+        threadMap = M.fromList . map (, Nothing) $ M.keys sockMap  :: ThreadMap
+      playLoop threadMap hEventFunc pmStream
 
-      setFilter stream filterSysex
+playLoop :: ThreadMap
+         -> (ThreadMap -> PMEvent -> IO ThreadMap)
+         -> PMStream -> IO ()
+playLoop threadMap hEventFunc pmStream = do
+  evs <- readEvents pmStream
+  case evs of
+    Right events -> do
+      threadMap' <- foldM hEventFunc threadMap events
+      playLoop threadMap' hEventFunc pmStream
+    Left _       -> pure ()
 
-      forever $ do
-        evs <- readEvents stream
-        case evs of
-          Right events -> mapM_ (handleEvent sockH) events
-          Left _       -> pure ()
-
-playAt:: Handle -> String -> IO ()
-playAt h timeStr = do
-  sendMPV h  ("{\"command\": [\"seek\", \"" ++ timeStr ++ "\", \"absolute\"] }")
-  sendMPV h  "{\"command\": [\"set_property\", \"pause\", false] }"
+playAt:: Handle -> Double -> IO ()
+playAt h time = do
+  sendMPV h ("{\"command\": [\"seek\", \"" ++ show time ++ "\", \"absolute\"] }")
+  sendMPV h "{\"command\": [\"set_property\", \"pause\", false] }"
   return ()
 
-handleEvent :: Handle -> PMEvent -> IO ()
-handleEvent sockH (PMEvent clMsg _) =
+pause:: Handle -> IO ()
+pause = flip sendMPV "{\"command\": [\"set_property\", \"pause\", true]}"
+
+genPlayThread :: SockMap -> ThreadMap
+              -> (String, Double, Double)
+              -> IO ThreadMap
+genPlayThread sockMap threadMap (sockPath, from, to) = case threadMap M.! sockPath of
+  Just tid -> do
+    -- Kill existing thread if any.
+    putStrLn "Killing existing thread to resume."
+    killThread tid
+    let threadMap' = M.insert sockPath Nothing threadMap
+    genPlayThread sockMap threadMap' (sockPath, from, to)
+  Nothing -> do
+    putStrLn "Starting new play thread."
+    -- Start new thread.
+    tid <- forkIO $ do
+              playAt (sockMap M.! sockPath) from
+              let waitTime = round ((to - from) * 1e6) :: Int
+              threadDelay waitTime
+              pause $ sockMap M.! sockPath
+    let threadMap' = M.insert sockPath (Just tid) threadMap
+    return threadMap'
+
+cancelThread :: SockMap -> ThreadMap  -> FilePath -> IO ThreadMap
+cancelThread sockMap threadMap sockPath = case threadMap M.! sockPath of
+  Just tid -> do
+    putStrLn "Killing existing thread as cancel."
+    killThread tid
+    pause $ sockMap M.! sockPath
+    let threadMap' = M.insert sockPath Nothing threadMap
+    return threadMap'
+  Nothing -> return threadMap
+
+handleEvent :: NoteMap -> SockMap -> ThreadMap  -> PMEvent -> IO ThreadMap
+handleEvent noteMap sockMap threadMap (PMEvent clMsg _) =
   let 
       msg = decodeMsg clMsg
       stat = status msg
-      d1 = data1 msg
-      d2 = data2 msg
-      chan = stat .&. 0x0F
-   in case stat .&. 0xF0 of
-        0x90 -> do   -- NoteOn
-          if d2 == 0
-            then putStrLn $ "chan:" ++ show chan
-                            ++ " Note Off (via velocity 0): " ++ show d1
-            else do
-              putStrLn $ "chan:" ++ show chan ++ " Note On: " ++ show d1
-              playAt sockH "00:00:01.5"
-
-        0x80 -> putStrLn $ "chan:" ++ show chan ++ " Note Off: " ++ show d1
-        _    -> pure ()
+      d1 = fromEnum $ data1 msg :: Int
+      d2 = fromEnum $ data2 msg :: Int
+      cmd = stat .&. 0xF0
+      chan = fromEnum $ stat .&. 0x0F :: Int
+      hitNotes = M.lookup (chan, d1) noteMap  :: Maybe [(FilePath, Double, Double)]
+      cancel = case hitNotes of
+                Just xs -> foldM
+                            (\tm (sockPath, _, _) -> cancelThread sockMap tm sockPath)
+                            threadMap xs :: IO ThreadMap
+                Nothing -> return threadMap
+   in case cmd of
+        0x90 -> if d2 == 0
+                  then do
+                    putStrLn $ "chan:" ++ show chan
+                                ++ " Note Off (via velocity 0): "
+                                ++ show d1
+                    -- cancel
+                    return threadMap
+                  else do
+                    putStrLn $ "chan:" ++ show chan ++ " Note On: " ++ show d1
+                    case hitNotes of
+                      Nothing -> return threadMap
+                      Just xs ->
+                        foldM (genPlayThread sockMap) threadMap xs
+        0x80 -> do
+                  putStrLn $ "chan:" ++ show chan ++ " Note Off: " ++ show d1
+                  -- cancel
+                  return threadMap
+        _    -> return threadMap
