@@ -1,0 +1,3 @@
+[submodule "PortMidi"]
+	path = PortMidi
+	url = git@github.com:yosukeueda33/PortMidi-haskell.git
