@@ -31,12 +31,13 @@ snapshot: lts-23.27
 #   - wai
 packages:
 - .
+- ./PortMidi
 # Dependency packages to be pulled from upstream that are not in the snapshot.
 # These entries can reference officially published versions as well as
 # forks / in-progress versions pinned to a git hash. For example:
 #
-extra-deps:
-- PortMidi-0.2.0.0
+# extra-deps:
+# - PortMidi-0.2.0.0
 
 # - acme-missiles-0.3
 # - git: https://github.com/commercialhaskell/stack.git
