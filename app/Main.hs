@@ -90,7 +90,7 @@ sendMPV h msg =
 main :: IO ()
 main = do
   -- Read config path from command line.
-  cfgPath <- readPathArg
+  (midiInId, cfgPath) <- readPathArg
   checkFilePath "config" cfgPath
   -- Load config.
   configs <- DHL.inputFile DHL.auto cfgPath :: IO [Config]
@@ -122,8 +122,7 @@ main = do
   mapM_ (\(id, info) -> putStrLn $ show id ++ ": " ++ show (name info))
     . filter (input . snd) $ zip [0..] devs
 
-  -- devID <- readLn
-  let devID = 3
+  let devID = midiInId
 
   r <- openInput devID
   case r of

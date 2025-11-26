@@ -1,24 +1,24 @@
+{-# LANGUAGE TupleSections #-}
+
 module ArgParse (readPathArg, checkFilePath) where
 
 import System.Exit ( exitFailure, exitSuccess )
-import System.Environment ( getArgs, getExecutablePath )
-import System.FilePath ((</>), takeDirectory)
+import System.Environment (getArgs)
 import System.Directory (doesFileExist, makeAbsolute)
-import Data.Functor ( (<&>) )
 import Control.Monad ( unless )
 
 
-readPathArg :: IO FilePath
+readPathArg :: IO (Int, FilePath)
 readPathArg = getArgs >>= parse
   where
-    parse :: [String] -> IO FilePath
+    parse :: [String] -> IO (Int, FilePath)
     parse ["-h"] = usage >> exit
     parse ["-v"] = version >> exit
     parse [] = usage >> exit
-    parse [x] = makeAbsolute x
+    parse [midiInId, path] = (read midiInId,) <$> makeAbsolute path
     parse _ = usage >> exit
     version = putStrLn "movMidi version 0.0"
-    usage = putStrLn "Usage: movMidi [-v|-h|CONFIG_PATH]"
+    usage = putStrLn "Usage: movMidi [-v|-h|MIDI_IN_ID CONFIG_PATH]"
     exit = exitSuccess
 
 checkFilePath :: String -> FilePath -> IO ()
