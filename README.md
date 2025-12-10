@@ -5,6 +5,10 @@ Midi to movie playback converter.
 usage example:
 https://youtube.com/shorts/Brvy3cwDJFk?feature=share
 
+# Requirements.
+mpv https://mpv.io/  
+ghcup for stack https://www.haskell.org/ghcup/
+
 # Build.
 ```bash
 stack build
